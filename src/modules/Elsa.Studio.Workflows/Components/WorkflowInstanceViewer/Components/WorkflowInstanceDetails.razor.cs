@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using Elsa.Api.Client.Extensions;
 using Elsa.Api.Client.Resources.StorageDrivers.Models;
 using Elsa.Api.Client.Resources.WorkflowDefinitions.Models;
 using Elsa.Api.Client.Resources.WorkflowInstances.Enums;
@@ -31,10 +33,20 @@ public partial class WorkflowInstanceDetails
     [Parameter]
     public WorkflowDefinition? WorkflowDefinition { get; set; }
 
+    /// <summary>
+    /// Gets or sets the current selected sub-workflow.
+    /// </summary>
+    [Parameter]
+    public JsonObject? SelectedSubWorkflow { get; set; } = default!;
+
     [Inject] private IStorageDriverService StorageDriverService { get; set; } = default!;
     [Inject] private IWorkflowInstanceObserverFactory WorkflowInstanceObserverFactory { get; set; } = default!;
     [Inject] private IWorkflowInstanceService WorkflowInstanceService { get; set; } = default!;
-    private IDictionary<string, StorageDriverDescriptor> StorageDriverLookup { get; set; } = new Dictionary<string, StorageDriverDescriptor>();
+    [Inject] private IActivityRegistry ActivityRegistry { get; set; } = default!;
+
+    private IDictionary<string, StorageDriverDescriptor> StorageDriverLookup { get; set; } =
+        new Dictionary<string, StorageDriverDescriptor>();
+
     private IWorkflowInstanceObserver WorkflowInstanceObserver { get; set; } = default!;
 
     private IDictionary<string, DataPanelItem> WorkflowInstanceData
@@ -47,7 +59,7 @@ public partial class WorkflowInstanceDetails
             return new Dictionary<string, DataPanelItem>
             {
                 ["ID"] = new(_workflowInstance.Id),
-                ["Definition ID"] = new(_workflowInstance.DefinitionId,$"/workflows/definitions/{_workflowInstance.DefinitionId}/edit"),
+                ["Definition ID"] = new(_workflowInstance.DefinitionId, $"/workflows/definitions/{_workflowInstance.DefinitionId}/edit"),
                 ["Definition version"] = new(_workflowInstance.Version.ToString()),
                 ["Definition version ID"] = new(_workflowInstance.DefinitionVersionId),
                 ["Correlation ID"] = new(_workflowInstance.CorrelationId),
@@ -60,6 +72,39 @@ public partial class WorkflowInstanceDetails
                 ["Finished"] = new(_workflowInstance.FinishedAt?.ToString("G")),
             };
         }
+    }
+
+    private Dictionary<string, DataPanelItem> WorkflowInstanceSubWorkflowData
+    {
+        get
+        {
+            if (SelectedSubWorkflow == null)
+                return new ();
+
+            var typeName = SelectedSubWorkflow.GetTypeName();
+            var version = SelectedSubWorkflow.GetVersion();
+            var descriptor = ActivityRegistry.Find(typeName, version);
+            var isWorkflowActivity = descriptor != null && descriptor.CustomProperties.TryGetValue("RootType", out var rootTypeNameElement) && ((JsonElement)rootTypeNameElement).GetString() == "WorkflowDefinitionActivity";
+            var workflowDefinitionId = isWorkflowActivity ? SelectedSubWorkflow.GetWorkflowDefinitionId() : default;
+
+            if (workflowDefinitionId == null)
+                return new ();
+
+            return new()
+            {
+                ["ID"] = new(SelectedSubWorkflow.GetId()),
+                ["Name"] = new(SelectedSubWorkflow.GetName()),
+                ["Type"] = new(SelectedSubWorkflow.GetTypeName()),
+                ["Definition ID"] = new(workflowDefinitionId, $"/workflows/definitions/{workflowDefinitionId}/edit"),
+                ["Definition version"] = new(SelectedSubWorkflow.GetVersion().ToString()),
+            };
+        }
+    }
+
+    public void UpdateSubWorkflow(JsonObject? obj)
+    {
+        SelectedSubWorkflow = obj;
+        StateHasChanged();
     }
 
     /// <inheritdoc />
@@ -108,7 +153,9 @@ public partial class WorkflowInstanceDetails
         if (storageDriverTypeName == null)
             return "None";
 
-        return !StorageDriverLookup.TryGetValue(storageDriverTypeName, out var descriptor) ? storageDriverTypeName : descriptor.DisplayName;
+        return !StorageDriverLookup.TryGetValue(storageDriverTypeName, out var descriptor)
+            ? storageDriverTypeName
+            : descriptor.DisplayName;
     }
 
     private string GetVariableValue(Variable variable)
@@ -119,7 +166,8 @@ public partial class WorkflowInstanceDetails
         if (_workflowActivityExecutionContext == null)
             return defaultValue;
 
-        if (!_workflowActivityExecutionContext.Properties.TryGetValue("PersistentVariablesDictionary", out var variablesDictionaryObject))
+        if (!_workflowActivityExecutionContext.Properties.TryGetValue("PersistentVariablesDictionary",
+                out var variablesDictionaryObject))
             return defaultValue;
 
         var dictionary = ((JsonElement)variablesDictionaryObject).Deserialize<IDictionary<string, object>>()!;
@@ -129,7 +177,8 @@ public partial class WorkflowInstanceDetails
 
     private static string GetIncidentStrategyDisplayName(string? incidentStrategyTypeName)
     {
-        return incidentStrategyTypeName?.Split(",", StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).First()
+        return incidentStrategyTypeName
+            ?.Split(",", StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).First()
             .Split(".", StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Last()
             .Replace("Strategy", "")
             .Humanize() ?? "Default";
