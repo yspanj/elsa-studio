@@ -59,7 +59,7 @@ public partial class InputsTab
     [CascadingParameter] private ExpressionDescriptorProvider ExpressionDescriptorProvider { get; set; } = default!;
     [Inject] private IUIHintService UIHintService { get; set; } = default!;
 
-    [Inject] private IRemoteBackendApiClientProvider RemoteBackendApiClientProvider { get; set; } = default!;
+    [Inject] private IBackendApiClientProvider BackendApiClientProvider { get; set; } = default!;
     private ICollection<InputDescriptor> InputDescriptors { get; set; } = new List<InputDescriptor>();
     private ICollection<OutputDescriptor> OutputDescriptors { get; set; } = new List<OutputDescriptor>();
     private ICollection<ActivityInputDisplayModel> InputDisplayModels { get; set; } = new List<ActivityInputDisplayModel>();
@@ -78,8 +78,9 @@ public partial class InputsTab
     private async Task<IEnumerable<ActivityInputDisplayModel>> BuildInputEditorModels(JsonObject activity, ActivityDescriptor activityDescriptor, ICollection<InputDescriptor> inputDescriptors)
     {
         var models = new List<ActivityInputDisplayModel>();
+        var browsableInputDescriptors = inputDescriptors.Where(x => x.IsBrowsable == true).OrderBy(x => x.Order).ToList();
 
-        foreach (var inputDescriptor in inputDescriptors)
+        foreach (var inputDescriptor in browsableInputDescriptors)
         {
             var inputName = inputDescriptor.Name.Camelize();
             var value = activity.GetProperty(inputName);
@@ -108,7 +109,7 @@ public partial class InputsTab
                 Value = input,
                 SelectedExpressionDescriptor = syntaxProvider,
                 UIHintHandler = uiHintHandler,
-                IsReadOnly = Workspace?.IsReadOnly ?? false
+                IsReadOnly = (Workspace?.IsReadOnly ?? false) || (inputDescriptor.IsReadOnly ?? false),
             };
 
             context.OnValueChanged = async v => await HandleValueChangedAsync(context, v);
@@ -134,17 +135,14 @@ public partial class InputsTab
                 contextDictionary.Add(inputName, value);
         }
 
-        var api = await RemoteBackendApiClientProvider.GetApiAsync<IActivityDescriptorOptionsApi>();
+        var api = await BackendApiClientProvider.GetApiAsync<IActivityDescriptorOptionsApi>();
 
-        await InvokeWithBlazorServiceContext(async () =>
+        var result = await api.GetAsync(activityTypeName, propertyName, new GetActivityDescriptorOptionsRequest()
         {
-            var result = await api.GetAsync(activityTypeName, propertyName, new GetActivityDescriptorOptionsRequest()
-            {
-                Context = contextDictionary
-            });
-
-            currentInputDescriptor.UISpecifications = result.Items;
+            Context = contextDictionary
         });
+
+        currentInputDescriptor.UISpecifications = result.Items;
     }
 
     private static WrappedInput? ToWrappedInput(object? value)

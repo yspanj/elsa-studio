@@ -1,15 +1,17 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Elsa.Api.Client.Extensions;
+using Elsa.Api.Client.RealTime.Messages;
 using Elsa.Api.Client.Resources.ActivityDescriptors.Models;
 using Elsa.Api.Client.Resources.ActivityExecutions.Models;
 using Elsa.Api.Client.Resources.WorkflowDefinitions.Models;
 using Elsa.Api.Client.Resources.WorkflowInstances.Enums;
 using Elsa.Api.Client.Resources.WorkflowInstances.Models;
-using Elsa.Api.Client.Shared.Models;
 using Elsa.Studio.DomInterop.Contracts;
 using Elsa.Studio.Workflows.Contracts;
 using Elsa.Studio.Workflows.Domain.Contracts;
 using Elsa.Studio.Workflows.Extensions;
+using Elsa.Studio.Workflows.Models;
 using Elsa.Studio.Workflows.Pages.WorkflowInstances.View.Models;
 using Elsa.Studio.Workflows.Shared.Args;
 using Elsa.Studio.Workflows.Shared.Components;
@@ -27,49 +29,32 @@ namespace Elsa.Studio.Workflows.Components.WorkflowInstanceViewer.Components;
 /// </summary>
 public partial class WorkflowInstanceDesigner : IAsyncDisposable
 {
-    private WorkflowInstance _workflowInstance = default!;
+    private WorkflowInstance? _workflowInstance = default!;
     private RadzenSplitterPane _activityPropertiesPane = default!;
-    private DiagramDesignerWrapper _designer = default!;
+    private DiagramDesignerWrapper? _designer;
+    private ActivityDetailsTab? _activityDetailsTab = default!;
+    private ActivityExecutionsTab? _activityExecutionsTab = default!;
     private int _propertiesPaneHeight = 300;
-    private IDictionary<string, ActivityNode> _activityNodeLookup = new Dictionary<string, ActivityNode>();
-    private readonly IDictionary<string, ICollection<ActivityExecutionRecord>> _activityExecutionRecordsLookup = new Dictionary<string, ICollection<ActivityExecutionRecord>>();
+    private readonly IDictionary<string, ICollection<ActivityExecutionRecordSummary>> _activityExecutionRecordsLookup = new Dictionary<string, ICollection<ActivityExecutionRecordSummary>>();
     private Timer? _elapsedTimer;
-    private bool _activateEventsTabPanel = false;
 
-    /// <summary>
     /// The workflow instance.
-    /// </summary>
-    [Parameter]
-    public WorkflowInstance WorkflowInstance { get; set; } = default!;
+    [Parameter] public WorkflowInstance? WorkflowInstance { get; set; }
 
-    /// <summary>
     /// The workflow definition.
-    /// </summary>
-    [Parameter]
-    public WorkflowDefinition? WorkflowDefinition { get; set; }
+    [Parameter] public WorkflowDefinition? WorkflowDefinition { get; set; }
 
-    /// <summary>
-    /// The selected workflow execution log record.
-    /// </summary>
-    [Parameter]
-    public JournalEntry? SelectedWorkflowExecutionLogRecord { get; set; }
-
-    /// <summary>
     /// The path changed callback.
-    /// </summary>
-    [Parameter]
-    public Func<DesignerPathChangedArgs, Task>? PathChanged { get; set; }
+    [Parameter] public EventCallback<DesignerPathChangedArgs> PathChanged { get; set; }
 
-    /// <summary>
     /// The activity selected callback.
-    /// </summary>
-    [Parameter]
-    public Func<JsonObject, Task>? ActivitySelected { get; set; }
+    [Parameter] public EventCallback<JsonObject> ActivitySelected { get; set; }
 
-    /// <summary>
-    /// An event that is invoked when a workflow definition is edited.
-    /// </summary>
+    /// An event that is invoked when the workflow definition is requested to be edited.
     [Parameter] public EventCallback<string> EditWorkflowDefinition { get; set; }
+
+    /// Gets or sets the current selected sub-workflow.
+    [Parameter] public JsonObject? SelectedSubWorkflow { get; set; }
 
     [Inject] private IActivityRegistry ActivityRegistry { get; set; } = default!;
     [Inject] private IDiagramDesignerService DiagramDesignerService { get; set; } = default!;
@@ -78,12 +63,17 @@ public partial class WorkflowInstanceDesigner : IAsyncDisposable
     [Inject] private IActivityExecutionService ActivityExecutionService { get; set; } = default!;
     [Inject] private IWorkflowInstanceObserverFactory WorkflowInstanceObserverFactory { get; set; } = default!;
     [Inject] private IWorkflowInstanceService WorkflowInstanceService { get; set; } = default!;
+    [Inject] private IWorkflowDefinitionService WorkflowDefinitionService { get; set; } = default!;
     [Inject] private NavigationManager NavigationManager { get; set; } = default!;
 
+    private JsonObject? RootActivity => WorkflowDefinition?.Root;
     private JsonObject? SelectedActivity { get; set; }
     private ActivityDescriptor? ActivityDescriptor { get; set; }
-    private IWorkflowInstanceObserver WorkflowInstanceObserver { get; set; } = default!;
-    private ICollection<ActivityExecutionRecord> SelectedActivityExecutions { get; set; } = new List<ActivityExecutionRecord>();
+    private JournalEntry? SelectedWorkflowExecutionLogRecord { get; set; }
+    private IWorkflowInstanceObserver? WorkflowInstanceObserver { get; set; } = default!;
+    private ICollection<ActivityExecutionRecordSummary> SelectedActivityExecutions { get; set; } = new List<ActivityExecutionRecordSummary>();
+    private ActivityExecutionRecord? LastActivityExecution { get; set; }
+    private Timer? _refreshTimer;
 
     private RadzenSplitterPane ActivityPropertiesPane
     {
@@ -100,6 +90,29 @@ public partial class WorkflowInstanceDesigner : IAsyncDisposable
     private MudTabs PropertyTabs { get; set; } = default!;
     private MudTabPanel EventsTabPanel { get; set; } = default!;
 
+    /// Updates the selected sub-workflow.
+    public void UpdateSubWorkflow(JsonObject? obj)
+    {
+        SelectedSubWorkflow = obj;
+        StateHasChanged();
+    }
+
+    /// Selects the activity by its node ID.
+    public async Task SelectActivityAsync(string nodeId)
+    {
+        if (_designer == null) return;
+        await _designer.SelectActivityAsync(nodeId);
+    }
+
+    /// Sets the selected journal entry.
+    public async Task SelectWorkflowExecutionLogRecordAsync(JournalEntry entry)
+    {
+        var nodeId = entry.Record.NodeId;
+        SelectedWorkflowExecutionLogRecord = entry;
+        await SelectActivityAsync(nodeId);
+        StateHasChanged();
+    }
+
     /// <inheritdoc />
     protected override async Task OnInitializedAsync()
     {
@@ -108,35 +121,20 @@ public partial class WorkflowInstanceDesigner : IAsyncDisposable
         if (WorkflowDefinition?.Root == null!)
             return;
 
-        _activityNodeLookup = await ActivityVisitor.VisitAndMapAsync(WorkflowDefinition);
-
-        // If the workflow instance is still running, observe it.
-        if (WorkflowInstance.Status == WorkflowStatus.Running)
-        {
-            await ObserveWorkflowInstanceAsync();
-            StartElapsedTimer();
-        }
+        await UpdateObserverAsync();
     }
 
     /// <inheritdoc />
     protected override async Task OnParametersSetAsync()
     {
-        // ReSharper disable once RedundantCheckBeforeAssignment
+        var hasDifferentState = _workflowInstance?.Id != WorkflowInstance?.Id || _workflowInstance?.Status != WorkflowInstance?.Status;
+
         if (_workflowInstance != WorkflowInstance)
-            _workflowInstance = WorkflowInstance;
-
-        // If a workflow execution log record is selected, check to see if it's associated with an activity.
-        if (SelectedWorkflowExecutionLogRecord != null)
         {
-            var nodeId = SelectedWorkflowExecutionLogRecord.Record.NodeId;
-            var activityNode = _activityNodeLookup.TryGetValue(nodeId, out var activityObject) ? activityObject : default;
+            _workflowInstance = WorkflowInstance!;
 
-            if (activityNode != null)
-            {
-                _activateEventsTabPanel = true;
-
-                await SelectActivityAsync(activityNode);
-            }
+            if (hasDifferentState)
+                await UpdateObserverAsync();
         }
     }
 
@@ -145,77 +143,133 @@ public partial class WorkflowInstanceDesigner : IAsyncDisposable
     {
         if (firstRender)
         {
-            await HandleActivitySelectedAsync(WorkflowDefinition!.Root);
+            if (WorkflowDefinition != null)
+                await HandleActivitySelectedAsync(WorkflowDefinition!.Root);
             await UpdatePropertiesPaneHeightAsync();
-        }
-
-        if (_activateEventsTabPanel)
-        {
-            PropertyTabs.ActivatePanel(EventsTabPanel);
-            _activateEventsTabPanel = false;
+            await UpdateObserverAsync();
         }
     }
 
-    private async Task ObserveWorkflowInstanceAsync()
+    private async Task UpdateObserverAsync()
     {
-        WorkflowInstanceObserver = await WorkflowInstanceObserverFactory.CreateAsync(WorkflowInstance.Id);
-        WorkflowInstanceObserver.ActivityExecutionLogUpdated += async message => await InvokeAsync(async () =>
+        if (WorkflowInstance?.Status == WorkflowStatus.Running)
         {
-            foreach (var stats in message.Stats)
-            {
-                var activityId = stats.ActivityId;
-                _activityExecutionRecordsLookup.Remove(activityId);
-                await _designer.UpdateActivityStatsAsync(activityId, Map(stats));
-            }
-
-            StateHasChanged();
-
-            // If we received an update for the selected activity, refresh the activity details.
-            var selectedActivityId = SelectedActivity?.GetId();
-            var includesSelectedActivity = selectedActivityId != null && message.Stats.Any(x => x.ActivityId == selectedActivityId);
-
-            if (includesSelectedActivity)
-                await HandleActivitySelectedAsync(SelectedActivity!);
-        });
-
-        WorkflowInstanceObserver.WorkflowInstanceUpdated += async _ => await InvokeAsync(async () =>
+            await CreateObserverAsync();
+            StartElapsedTimer();
+        }
+        else
         {
-            _workflowInstance = (await InvokeWithBlazorServiceContext(() => WorkflowInstanceService.GetAsync(_workflowInstance.Id)))!;
+            StopElapsedTimer();
+        }
+    }
 
-            if (_workflowInstance.Status == WorkflowStatus.Finished)
-            {
-                if (_elapsedTimer != null)
-                    await _elapsedTimer.DisposeAsync();
-            }
-        });
+    private async Task CreateObserverAsync()
+    {
+        if (_workflowInstance == null || _designer == null)
+            return;
+
+        await DisposeObserverAsync();
+        var container = _designer.GetCurrentContainerActivityOrRoot();
+        var observerContext = new WorkflowInstanceObserverContext
+        {
+            WorkflowInstanceId = _workflowInstance.Id,
+            ContainerActivity = container,
+        };
+        WorkflowInstanceObserver = await WorkflowInstanceObserverFactory.CreateAsync(observerContext);
+        WorkflowInstanceObserver.ActivityExecutionLogUpdated += OnActivityExecutionLogUpdated;
+    }
+
+    private async Task DisposeObserverAsync()
+    {
+        if (WorkflowInstanceObserver != null!)
+        {
+            WorkflowInstanceObserver.ActivityExecutionLogUpdated -= OnActivityExecutionLogUpdated;
+            await WorkflowInstanceObserver.DisposeAsync();
+            WorkflowInstanceObserver = null;
+        }
+    }
+
+    private async Task OnActivityExecutionLogUpdated(ActivityExecutionLogUpdatedMessage message)
+    {
+        if (_designer == null) return;
+
+        foreach (var stats in message.Stats)
+        {
+            var activityNodeId = stats.ActivityNodeId;
+            var activityId = stats.ActivityId;
+            _activityExecutionRecordsLookup.Remove(activityNodeId);
+            await _designer.UpdateActivityStatsAsync(activityId, Map(stats));
+        }
+
+        await InvokeAsync(StateHasChanged);
+
+        // If we received an update for the selected activity, refresh the activity details.
+        var selectedActivityNodeId = SelectedActivity?.GetNodeId();
+        var includesSelectedActivity = selectedActivityNodeId != null && message.Stats.Any(x => x.ActivityNodeId == selectedActivityNodeId);
+
+        if (includesSelectedActivity)
+        {
+            await HandleActivitySelectedAsync(SelectedActivity!);
+        }
     }
 
     private void StartElapsedTimer()
     {
-        _elapsedTimer = new Timer(_ => InvokeAsync(StateHasChanged), null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
+        if (_elapsedTimer == null)
+            _elapsedTimer = new Timer(_ => InvokeAsync(StateHasChanged), null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
     }
 
-    private async Task SelectActivityAsync(ActivityNode activityNode)
+    private void StopElapsedTimer()
     {
-        await _designer.SelectActivityAsync(activityNode);
+        if (_elapsedTimer != null)
+        {
+            _elapsedTimer?.Dispose();
+            _elapsedTimer = null;
+        }
     }
 
     private async Task HandleActivitySelectedAsync(JsonObject activity)
     {
-        var activityNodeId = activity.GetNodeId()!;
-        SelectedActivity = activity;
-        ActivityDescriptor = ActivityRegistry.Find(activity!.GetTypeName(), activity!.GetVersion());
-        SelectedActivityExecutions = await GetActivityExecutionRecordsAsync(activityNodeId);
+        await StopRefreshActivityStatePeriodically();
+        await InvokeAsync(async () =>
+        {
+            var activityNodeId = activity.GetNodeId();
+            SelectedActivity = activity;
+            ActivityDescriptor = ActivityRegistry.Find(activity.GetTypeName(), activity.GetVersion());
+            SelectedActivityExecutions = await GetActivityExecutionRecordsAsync(activityNodeId);
+            StateHasChanged();
+            _activityDetailsTab?.Refresh();
 
-        StateHasChanged();
+            if (_activityExecutionsTab != null)
+                await _activityExecutionsTab.RefreshAsync();
+        });
+
+        if (SelectedActivityExecutions.Any())
+        {
+            var lastRecord = SelectedActivityExecutions.Last();
+            LastActivityExecution = await ActivityExecutionService.GetAsync(lastRecord.Id);
+
+            if (LastActivityExecution != null)
+                RefreshActivityStatePeriodically(LastActivityExecution.Id);
+        }
     }
 
-    private async Task<ICollection<ActivityExecutionRecord>> GetActivityExecutionRecordsAsync(string activityNodeId)
+    private async Task<ICollection<ActivityExecutionRecordSummary>> GetActivityExecutionRecordsAsync(string activityNodeId)
     {
         if (!_activityExecutionRecordsLookup.TryGetValue(activityNodeId, out var records))
         {
-            records = (await InvokeWithBlazorServiceContext(() => ActivityExecutionService.ListAsync(WorkflowInstance.Id, activityNodeId))).ToList();
+            records = (await ActivityExecutionService.ListSummariesAsync(WorkflowInstance!.Id, activityNodeId)).ToList();
             _activityExecutionRecordsLookup[activityNodeId] = records;
+        }
+        
+        if (records.Any())
+        {
+            var lastRecord = records.Last();
+            LastActivityExecution = await ActivityExecutionService.GetAsync(lastRecord.Id);
+        }
+        else
+        {
+            LastActivityExecution = null;
         }
 
         return records;
@@ -226,6 +280,39 @@ public partial class WorkflowInstanceDesigner : IAsyncDisposable
         var paneQuerySelector = $"#{ActivityPropertiesPane.UniqueID}";
         var visibleHeight = await DomAccessor.GetVisibleHeightAsync(paneQuerySelector);
         _propertiesPaneHeight = (int)visibleHeight - 50;
+    }
+
+    private async Task RefreshSelectedItemAsync(string id)
+    {
+        var record = await ActivityExecutionService.GetAsync(id);
+        LastActivityExecution = record;
+        await InvokeAsync(() =>
+        {
+            StateHasChanged();
+            _activityDetailsTab?.Refresh();
+        });
+    }
+
+    private void RefreshActivityStatePeriodically(string id)
+    {
+        async void Callback(object? _)
+        {
+            await RefreshSelectedItemAsync(id);
+
+            if (LastActivityExecution == null || LastActivityExecution.IsFused())
+                await StopRefreshActivityStatePeriodically();
+        }
+
+        _refreshTimer = new Timer(Callback, null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
+    }
+
+    private async Task StopRefreshActivityStatePeriodically()
+    {
+        if (_refreshTimer != null)
+        {
+            await _refreshTimer.DisposeAsync();
+            _refreshTimer = null;
+        }
     }
 
     private static ActivityStats Map(ActivityExecutionStats source)
@@ -242,11 +329,12 @@ public partial class WorkflowInstanceDesigner : IAsyncDisposable
 
     private async Task OnActivitySelected(JsonObject activity)
     {
-        SelectedWorkflowExecutionLogRecord = null;
         await HandleActivitySelectedAsync(activity);
 
-        if (ActivitySelected != null)
-            await ActivitySelected(activity);
+        var activitySelected = ActivitySelected;
+
+        if (activitySelected.HasDelegate)
+            await activitySelected.InvokeAsync(activity);
     }
 
     private async Task OnResize(RadzenSplitterResizeEventArgs arg)
@@ -254,9 +342,25 @@ public partial class WorkflowInstanceDesigner : IAsyncDisposable
         await UpdatePropertiesPaneHeightAsync();
     }
 
-    private Task OnEditClicked(string definitionId)
+    private Task OnEditClicked()
     {
-        var editWorkflowDefinition = this.EditWorkflowDefinition;
+        var definitionId = WorkflowDefinition!.DefinitionId;
+
+        if (SelectedSubWorkflow != null)
+        {
+            var typeName = SelectedSubWorkflow.GetTypeName();
+            var version = SelectedSubWorkflow.GetVersion();
+            var descriptor = ActivityRegistry.Find(typeName, version);
+            var isWorkflowActivity = descriptor != null &&
+                                     descriptor.CustomProperties.TryGetValue("RootType", out var rootTypeNameElement) &&
+                                     ((JsonElement)rootTypeNameElement).GetString() == "WorkflowDefinitionActivity";
+            if (isWorkflowActivity)
+            {
+                definitionId = SelectedSubWorkflow.GetWorkflowDefinitionId();
+            }
+        }
+
+        var editWorkflowDefinition = EditWorkflowDefinition;
 
         if (editWorkflowDefinition.HasDelegate)
             return editWorkflowDefinition.InvokeAsync(definitionId);
@@ -267,10 +371,10 @@ public partial class WorkflowInstanceDesigner : IAsyncDisposable
 
     async ValueTask IAsyncDisposable.DisposeAsync()
     {
-        if (WorkflowInstanceObserver != null!)
-            await WorkflowInstanceObserver.DisposeAsync();
+        StopElapsedTimer();
+        await DisposeObserverAsync();
 
-        if (_elapsedTimer != null!)
-            await _elapsedTimer.DisposeAsync();
+        if (_refreshTimer != null)
+            await _refreshTimer.DisposeAsync();
     }
 }
